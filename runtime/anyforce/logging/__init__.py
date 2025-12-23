@@ -8,7 +8,7 @@ import orjson
 import structlog
 from structlog.types import EventDict
 
-from .factory import gelf, multi
+from .factory import multi
 
 CRITICAL = logging.CRITICAL
 ERROR = logging.ERROR
@@ -38,8 +38,7 @@ shared_processors: list[structlog.typing.Processor] = [
     add_logger,
 ]
 
-gelf_address = os.environ.get("LOG_GELF_ADDRESS", "")
-if gelf_address or not sys.stderr.isatty():
+if not sys.stderr.isatty():
     hostname = socket.gethostname()
 
     def gelf_processor(logger: Any, method_name: str, event_dict: EventDict):
@@ -57,16 +56,7 @@ if gelf_address or not sys.stderr.isatty():
         structlog.processors.JSONRenderer(serializer=orjson.dumps),
     ]
 
-    enable_stdout = os.environ.get("LOG_ENABLE_STDOUT", "false") == "true"
-    logger_factory = (
-        multi.Factory(gelf.UDPFactory(gelf_address), structlog.BytesLoggerFactory())
-        if enable_stdout
-        else multi.Factory(
-            gelf.UDPFactory(gelf_address)
-            if gelf_address
-            else structlog.BytesLoggerFactory()
-        )
-    )
+    logger_factory = structlog.BytesLoggerFactory()
 else:
     processors = shared_processors + [structlog.dev.ConsoleRenderer()]
     logger_factory = multi.Factory(structlog.WriteLoggerFactory())
