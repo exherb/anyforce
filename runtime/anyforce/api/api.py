@@ -547,7 +547,6 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
                     total = r[0]["total"] if r else 0
                 else:
                     total = await DistinctCountQuery(q.count())
-                    q = q.distinct()
 
                 q = q.offset(offset).limit(limit)
                 if group_by:
