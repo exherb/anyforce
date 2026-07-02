@@ -1,21 +1,37 @@
-from typing import Any
+from __future__ import annotations
 
-from tortoise import Tortoise
+from typing import Any, cast
 
-from .base import BaseModel, BaseUpdateModel
+from .base import (
+    BaseModel,
+    BaseUpdateModel,
+    close_engine,
+    configure_engine,
+    create_all,
+    init_models,
+)
 from .enum import IntEnum, StrEnum
 from .recoverable import RecoverableModel
 
 
-async def init(config: dict[str, Any]):
-    await Tortoise.init(config=config)  # type: ignore
-    for k in config["apps"]:
-        Tortoise.get_connection(k)
+async def init(config: dict[str, Any]) -> None:
+    db_url = str(config.get("db_url") or "")
+    if not db_url:
+        connections = cast(dict[str, Any], config.get("connections", {}))
+        default = connections.get("default")
+        db_url = str(default or "sqlite://:memory:")
+    configure_engine(db_url)
+    apps = cast(dict[str, dict[str, Any]], config.get("apps", {}))
+    for name, info in apps.items():
+        init_models(cast(list[str], info.get("models", [])), name)
 
 
-def init_models(config: dict[str, Any]):
-    for name, info in config["apps"].items():
-        Tortoise.init_models(info["models"], name)
+def generate_schemas(safe: bool = True) -> None:
+    create_all()
+
+
+async def close_connections() -> None:
+    close_engine()
 
 
 __all__ = [
@@ -24,4 +40,8 @@ __all__ = [
     "BaseModel",
     "BaseUpdateModel",
     "RecoverableModel",
+    "init",
+    "init_models",
+    "generate_schemas",
+    "close_connections",
 ]

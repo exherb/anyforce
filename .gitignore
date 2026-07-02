@@ -341,3 +341,6 @@ temp/
 # workspace
 .env
 .envrc
+
+# AI
+.codegraph

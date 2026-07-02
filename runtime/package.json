@@ -2,7 +2,7 @@
     "name": "runtime",
     "private": true,
     "scripts": {
-        "postinstall": "pip3 install --upgrade uv --break-system-packages && uv sync && touch $(uv run python -c 'import os, pypika_tortoise; print(os.path.dirname(pypika_tortoise.__file__))')/py.typed",
+        "postinstall": "pip3 install --upgrade uv --break-system-packages && uv sync",
         "lint": "concurrently npm:lint-ruff npm:lint-pyright",
         "lint-ruff": "uv run ruff check --fix",
         "lint-pyright": "pyright -p .",

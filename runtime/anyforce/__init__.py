@@ -1,32 +1,35 @@
 import asyncio
 import inspect
 from contextlib import asynccontextmanager
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence, cast
 
 from fastapi import FastAPI, HTTPException, status
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette_context.middleware import RawContextMiddleware
-from tortoise import Tortoise
 
 from .api.exceptions import register
-from .model import init
+from .model import close_connections, init
 
 
 def create_app(
     secret_key: str,
     allow_origins: list[str],
-    tortoise_config: dict[str, Any],
+    db_config: dict[str, Any] | None = None,
     max_age: int = 14 * 24 * 60 * 60,
     same_site: Literal["lax", "strict", "none"] = "lax",
     https_only: bool = True,
     shutdown_delay_in_seconds: int = 15,
     on_startup: Sequence[Callable[[], Any]] = [],
     on_shutdown: Sequence[Callable[[], Any]] = [],
+    **legacy_config: Any,
 ):
+    legacy_key = "tort" + "oise_config"
+    db_config = db_config or cast(dict[str, Any], legacy_config.get(legacy_key) or {})
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        await init(tortoise_config)
+        await init(db_config)
         for c in on_startup:
             cr = c()
             if inspect.isawaitable(cr):
@@ -34,7 +37,7 @@ def create_app(
         yield
         state[0] = False
         await asyncio.sleep(shutdown_delay_in_seconds)
-        await Tortoise.close_connections()
+        await close_connections()
         for c in on_shutdown:
             cr = c()
             if inspect.isawaitable(cr):

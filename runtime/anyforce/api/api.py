@@ -1,35 +1,31 @@
 import asyncio
 from copy import copy
 from datetime import datetime
+from decimal import Decimal
 from enum import IntEnum
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Coroutine,
-    Generic,
-    Iterable,
-    Type,
-    TypeVar,
-    cast,
-)
+from typing import Any, Callable, Coroutine, Generic, Iterable, TypeVar, cast
 
-from fastapi import APIRouter, Body, Depends, Path, Query, Request, status
-from fastapi.responses import ORJSONResponse
+from dateutil.parser import parse as parse_datetime
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    Path,
+    Request,
+    status,
+)
+from fastapi import (
+    Query as FastAPIQuery,
+)
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import create_model
-from pypika_tortoise.functions import Count
-from pypika_tortoise.terms import Field as pikaField
-from pypika_tortoise.terms import Term
-from tortoise.expressions import Function, Q, RawSQL
-from tortoise.fields.base import Field
-from tortoise.models import MetaInfo
-from tortoise.queryset import CountQuery, QuerySet
+from sqlalchemy import func
+from sqlalchemy.sql.elements import ColumnElement
 
 from .. import json
 from ..model import BaseModel
+from ..model.base import Condition, ModelField, Query
 from ..model.functions import in_transaction
-from ..model.queryset import ValuesWithoutGroupByQuery
 from .exceptions import (
     HTTPForbiddenError,
     HTTPNotFoundError,
@@ -57,9 +53,9 @@ class DeleteResponse(PydanticBaseModel):
 class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
     def __init__(
         self,
-        model: Type[Model],
-        create_form: Type[CreateForm],
-        update_form: Type[UpdateForm],
+        model: type[Model],
+        create_form: type[CreateForm],
+        update_form: type[UpdateForm],
         get_current_user: Callable[..., Coroutine[Any, Any, UserModel] | UserModel],
         enable_create: bool = True,
         enable_update: bool = True,
@@ -67,7 +63,6 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
         enable_get: bool = True,
         enable_summary: bool = False,
     ) -> None:
-        super().__init__()
         self.model = model
         self.create_form = create_form
         self.update_form = update_form
@@ -87,82 +82,56 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
         return [self.model.normalize_field(ordering)]
 
     async def translate_condition(
-        self, user: UserModel, q: QuerySet[Model], k: str, v: Any, request: Request
+        self, user: UserModel, q: Query[Model], k: str, v: Any, request: Request
     ) -> Any:
         return v
 
-    def group_by_f(self, group_by: str, field: Field[Any]) -> Function | Term | None:
-        return None
+    def group_by_f(self, group_by: str, field: ModelField) -> ColumnElement[Any] | None:
+        if field.is_relation or field.python_type not in (int, float, Decimal):
+            return None
+        return cast(
+            ColumnElement[Any],
+            func.sum(getattr(self.model, group_by)),
+        )
 
     def group_by(
         self,
         user: UserModel,
-        q: QuerySet[Model],
+        q: Query[Model],
         include: Iterable[str],
         group_by: list[str],
         order_by: list[str],
-    ):
-        model_meta: MetaInfo = getattr(q.model, "_meta")
-        fields_map: dict[str, Field[Any]] = getattr(model_meta, "fields_map")
-        field_names: Iterable[str] = include or fields_map.keys()
-        annotates: dict[str, Function | Term] = {}
+    ) -> Query[Model]:
+        field_names = include or self.model.fields_map().keys()
+        annotates: dict[str, ColumnElement[Any]] = {}
         for field_name in field_names:
-            if field_name in group_by:
+            if field_name in group_by or field_name not in self.model.fields_map():
                 continue
-            field = fields_map[field_name]
+            field = self.model.fields_map()[field_name]
             annotate = self.group_by_f(field_name, field)
             if annotate is None:
                 continue
-
             group_by_name = f"_{field_name}_"
             annotates[group_by_name] = annotate
-
-            # order_by
-            for i, o in enumerate(order_by):
-                if o == field_name or o == f"-{field_name}":
-                    order_by[i] = o.replace(field_name, group_by_name)
-
-        q = q.annotate(**annotates)
-        q = q.group_by(*group_by)
-        return q
+            for i, ordering in enumerate(order_by):
+                if ordering == field_name or ordering == f"-{field_name}":
+                    order_by[i] = ordering.replace(field_name, group_by_name)
+        return q.annotate(**annotates).group_by(*group_by)
 
     async def grouping(
         self,
         user: UserModel,
-        q: QuerySet[Model],
+        q: Query[Model],
         include: Iterable[str],
         group_by: list[str],
-        order_by: list[str] = [],
+        order_by: list[str] | None = None,
     ) -> list[Model]:
         return await self.grouping_q(
-            self.group_by(user, q, include, group_by, order_by), group_by
+            self.group_by(user, q, include, group_by, order_by or []), group_by
         )
 
-    async def grouping_q(
-        self,
-        q: QuerySet[Model],
-        group_by: list[str],
-    ) -> list[Model]:
-        group_q = q.filter()
-        setattr(group_q, "_fields_for_select", tuple())
-        dicts = await ValuesWithoutGroupByQuery(
-            group_q.values(*set(group_by).union(getattr(q, "_annotations").keys()))
-        )
-        es: list[Model] = []
-        # overwrite default value
-        kwargs: dict[str, str] = {}
-        for k, field in self.model.fields_map().items():
-            if field.default and isinstance(field.default, str):
-                kwargs[k] = ""
-        for dic in dicts:
-            e = self.model()
-            for k, v in dic.items():
-                if v is None:
-                    continue
-                k = k[1:-1] if k.startswith("_") and k.endswith("_") else k
-                setattr(e, k, v)
-            es.append(e)
-        return es
+    async def grouping_q(self, q: Query[Model], group_by: list[str]) -> list[Model]:
+        return await q.grouped_models()
 
     async def excludes(self, method: ResourceMethod) -> set[str] | None:
         return None
@@ -171,37 +140,25 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
         self,
         user: UserModel,
         request: Request,
-        q: QuerySet[Model],
+        q: Query[Model],
         method: ResourceMethod,
-    ) -> QuerySet[Model]:
+    ) -> Query[Model]:
         excludes = await self.excludes(method)
-        if excludes:
-            model_meta = getattr(q.model, "_meta")
-            fields_db_projection: dict[str, Any] = (
-                getattr(model_meta, "fields_db_projection") if model_meta else {}
-            )
-            include: set[str] = (
-                set(
-                    getattr(q, "_fields_for_select", None)
-                    or fields_db_projection.keys()
-                )
-                - excludes
-            )
-            if not include:
-                raise HTTPForbiddenError
-            q = q.only(*include)
-        return q
+        if not excludes:
+            return q
+        include = set(q.selected or self.model.fields_db_projection().keys()) - excludes
+        if not include:
+            raise HTTPForbiddenError
+        return q.only(*include)
 
     async def fetch_related(
         self, obj: Model, method: ResourceMethod, prefetch: list[str]
-    ):
+    ) -> None:
         excludes = await self.excludes(method)
         if excludes:
-            include_prefetch = set(prefetch) - set(excludes)
-            if not include_prefetch:
-                return
-            prefetch = list(include_prefetch)
-        await obj.fetch_related(*prefetch)
+            prefetch = list(set(prefetch) - excludes)
+        if prefetch:
+            await obj.fetch_related(*prefetch)
 
     async def before_create(
         self,
@@ -246,31 +203,31 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
         return obj
 
     @classmethod
-    def ids_path(cls):
-        return Path(..., title="ID", description="支持采用 `1,2,3` 形式传入多个")
+    def ids_path(cls) -> Any:
+        return Path(..., title="ids", description="逗号分隔的 id")
 
     @classmethod
-    def include_query(cls):
-        return Query(
+    def include_query(cls) -> Any:
+        return FastAPIQuery(
             [],
-            title="只获取某些字段",
-            description="支持采用 `include=id&include=name` 形式传入多个",
+            title="包含字段",
+            description="支持采用 `include=id&include=user.id` 形式传入多个",
         )
 
     @classmethod
-    def prefetch_query(cls):
-        return Query(
+    def prefetch_query(cls) -> Any:
+        return FastAPIQuery(
             [],
-            title="动态加载计算字段",
-            description="获取更多字段, 支持采用 `prefetch=id&prefetch=user.id` 形式传入多个",
+            title="预加载字段",
+            description="支持采用 `prefetch=id&prefetch=user.id` 形式传入多个",
         )
 
     @classmethod
-    def group_by_query(cls):
-        return Query(
+    def group_by_query(cls) -> Any:
+        return FastAPIQuery(
             [],
-            title="分组",
-            description="分组, 不在分组字段默认为 MAX, 支持采用 `group_by=x&group_by=y` 形式传入多个",
+            title="分组字段",
+            description="支持采用 `group_by=id&group_by=user.id` 形式传入多个",
         )
 
     @classmethod
@@ -279,9 +236,8 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
         return f and f() or Body(...)
 
     @property
-    def connection_name(self):
-        meta: MetaInfo = getattr(self.model, "_meta")
-        return meta.default_connection
+    def connection_name(self) -> str:
+        return "default"
 
     async def get(
         self,
@@ -290,7 +246,7 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
         user: UserModel,
         request: Request,
         method: ResourceMethod,
-    ):
+    ) -> list[Model]:
         normalize_ids = await asyncio.gather(
             *[self.translate_id(user, id.strip(), request) for id in ids.split(",")]
         )
@@ -308,76 +264,69 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
         return objs
 
     async def translate_kv_condition(
-        self, user: UserModel, request: Request, q: QuerySet[Model], kv: dict[str, Any]
-    ) -> tuple[QuerySet[Model], Q]:
+        self, user: UserModel, request: Request, q: Query[Model], kv: dict[str, Any]
+    ) -> tuple[Query[Model], Condition]:
         join_infos: dict[str, tuple[str, bool]] = {
-            ".and": (Q.AND, False),
-            ".or": (Q.OR, False),
-            ".not": (Q.AND, True),
-            ".not_or": (Q.OR, True),
+            ".and": ("and", False),
+            ".or": ("or", False),
+            ".not": ("and", True),
+            ".not_or": ("or", True),
         }
 
-        qs: list[Q] = []
-        q_kwargs: dict[str, Any] = {}
+        conditions: list[Condition] = []
         for k, v in kv.items():
             child_join_type, child_reverse = join_infos.get(k, ("", False))
             if child_join_type:
-                if isinstance(v, dict):
-                    q, iq = await self.translate_kv_condition(
-                        user, request, q, cast(dict[str, Any], v)
-                    )
-                elif isinstance(v, list):
-                    cqs: list[Q] = []
-                    for cv in cast(list[dict[str, Any]], v):
-                        q, ciq = await self.translate_kv_condition(
-                            user,
-                            request,
-                            q,
-                            cv,
+                child_conditions: list[Condition] = []
+                values: list[Any] = cast(list[Any], v) if isinstance(v, list) else [v]
+                for child in values:
+                    if isinstance(child, dict):
+                        q, child_condition = await self.translate_kv_condition(
+                            user, request, q, cast(dict[str, Any], child)
                         )
-                        cqs.append(ciq)
-                    iq = Q(*cqs)
-                else:
-                    assert False
-                iq.join_type = child_join_type
-                if child_reverse:
-                    iq = ~iq
-                qs.append(iq)
+                        child_conditions.append(child_condition)
+                if not child_conditions:
+                    continue
+                condition = (
+                    sa_or(*child_conditions)
+                    if child_join_type == "or"
+                    else sa_and(*child_conditions)
+                )
+                conditions.append(~condition if child_reverse else condition)
                 continue
 
-            k = self.model.normalize_field(k)
-            v = await self.translate_condition(user, q, k, v, request)
-            if isinstance(v, QuerySet):
-                q = cast(QuerySet[Model], v)
-            elif isinstance(v, Q):
-                qs.append(v)
-            elif (
-                v is not None
-                and not (isinstance(v, list) and not v)
-                and not (isinstance(v, dict) and not v)
+            field = self.model.normalize_field(k)
+            translated = await self.translate_condition(user, q, field, v, request)
+            if isinstance(translated, Query):
+                q = cast(Query[Model], translated)
+                continue
+            if isinstance(translated, ColumnElement):
+                conditions.append(cast(Condition, translated))
+                continue
+            if (
+                translated is None
+                or (isinstance(translated, list) and not translated)
+                or (isinstance(translated, dict) and not translated)
             ):
-                q_kwargs[k] = v
-        kv_q = Q(
-            *qs,
-            **q_kwargs,
-            join_type=Q.AND,
-        )
-        return q, kv_q
+                continue
+            condition, joins = q.condition_from_key(field, translated)
+            q = q.with_joins(joins)
+            conditions.append(condition)
 
-    def bind(self, router: APIRouter):
-        list_exclude: set[str] = set(self.model.PydanticMeta.list_exclude or [])
-        if not TYPE_CHECKING:
-            CreateForm = self.create_form
-            UpdateForm = self.update_form
+        return q, sa_and(*conditions) if conditions else sa_and()
+
+    def bind(self, router: APIRouter) -> dict[str, Callable[..., Any]]:
+        list_exclude = set(self.model.PydanticMeta.list_exclude or [])
+
         ListPydanticModel = self.model.list()
         DetailPydanticModel = self.model.detail()
-
         DetailPydanticModels = list[DetailPydanticModel] | DetailPydanticModel
+
         Response = create_model(
             f"{self.model.__module__}.{self.model.__name__}.Response",
             __base__=PydanticBaseModel,
             total=(int, 0),
-            summary=(ListPydanticModel | None, ...),
+            summary=(ListPydanticModel | None, None),
             data=(list[ListPydanticModel], ...),
         )
 
@@ -388,29 +337,26 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
             @router.post(
                 "/",
                 response_model=DetailPydanticModels,
-                response_class=ORJSONResponse,
                 status_code=status.HTTP_201_CREATED,
                 response_model_exclude_unset=True,
                 response_model_exclude_none=True,
             )
             async def create(
                 request: Request,
-                input: list[CreateForm] | CreateForm = self.get_form_type(
-                    self.create_form
-                ),
+                input: Any = Body(...),
                 prefetch: list[str] = self.prefetch_query(),
                 current_user: UserModel = Depends(self.get_current_user),
             ) -> Any:
                 async with in_transaction(self.connection_name):
                     is_batch = isinstance(input, list)
-                    inputs = input if is_batch else [input]
-
+                    inputs: list[Any] = cast(list[Any], input) if is_batch else [input]
                     returns: list[PydanticBaseModel] = []
-                    for input in inputs:
-                        input = await self.before_create(current_user, input, request)
-                        raw, computed, m2ms = self.model.process(input)
+                    for raw_item in inputs:
+                        item = self.create_form.model_validate(raw_item)
+                        item = await self.before_create(current_user, item, request)
+                        raw, computed, m2ms = self.model.process(item)
                         obj = await self.before_save(
-                            current_user, self.model(**raw), input, request
+                            current_user, self.model(**raw), item, request
                         )
                         await obj.save()
                         await obj.update_computed(computed)
@@ -419,86 +365,46 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
                             await self.fetch_related(
                                 obj, ResourceMethod.create, prefetch
                             )
-
                         obj_rtn = await self.after_create(
-                            current_user, obj, input, request
+                            current_user, obj, item, request
                         )
-
-                        if obj_rtn:
-                            obj = obj_rtn
-
-                        if isinstance(obj, PydanticBaseModel):
-                            returns.append(obj)
-                        else:
-                            returns.append(DetailPydanticModel.model_validate(obj))
+                        obj = obj_rtn or obj
+                        returns.append(
+                            obj
+                            if isinstance(obj, PydanticBaseModel)
+                            and not isinstance(obj, BaseModel)
+                            else DetailPydanticModel.model_validate(obj)
+                        )
                     return returns if is_batch else returns[0]
 
             methods["create"] = create
 
         if self.enable_get:
-            help = """支持采用 `condition=...&condition=...` 传入多个, 使用 JSON 序列化
-[查询语法参考](https://tortoise-orm.readthedocs.io/en/latest/query.html#filtering)
-
-###### 简单查询
+            help_text = """
+支持 JSON 查询条件。
 
 ```javascript
-{
-    "email": "name@example.com",
-    "name.contains": "name",
-    "id.in": [1, 2, 3],
-}
+{ "email": "name@example.com", "name.contains": "name", "id.in": [1, 2, 3] }
 ```
-
-###### 跨表查询
-
-```javascript
-{
-    "user.email": "name@example.com",
-    "user.name.contains": "name",
-}
-```
-
-###### 子逻辑, 可选项: `.and` `.or` `.not` `.not_or`
-
-```javascript
-// (name contains name2 or email contains example2.com)
-{
-    ".or": {
-        "name.contains": "name2",
-        "email.contains": "example2.com",
-    },
-    "name.contains": "name",
-    "email.contains": "example.com",
-}
-
-// (name contains name2 and email contains example2.com) or (name contains name3)
-{
-    ".or": [{
-        "name.contains": "name2"
-        "email.contains": "example2.com",
-    }, {
-        "name.contains": "name3",
-    }],
-    "name.contains": "name",
-    "email.contains": "example.com",
-}
-```
-            """
+"""
 
             @router.get(
                 "/",
                 response_model=Response,
-                response_class=ORJSONResponse,
                 response_model_exclude_unset=True,
                 response_model_exclude_none=True,
             )
             async def index(
                 request: Request,
-                offset: int = Query(0, title="分页偏移"),
-                limit: int = Query(20, title="分页限额"),
-                include_summary: bool = Query(False, title="是否包含summary数据"),
-                condition: list[str] = Query([], title="查询条件", description=help),
-                order_by: list[str] = Query(
+                offset: int = FastAPIQuery(0, title="分页偏移"),
+                limit: int = FastAPIQuery(20, title="分页限额"),
+                include_summary: bool = FastAPIQuery(
+                    False, title="是否包含summary数据"
+                ),
+                condition: list[str] = FastAPIQuery(
+                    [], title="查询条件", description=help_text
+                ),
+                order_by: list[str] = FastAPIQuery(
                     [],
                     title="排序",
                     description="支持采用 `order_by=id&order_by=user.id` 形式传入多个",
@@ -509,48 +415,33 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
                 current_user: UserModel = Depends(self.get_current_user),
             ) -> Any:
                 q = self.model.all()
-
                 if not include and list_exclude:
-                    db_fields = set(self.model.fields_db_projection().keys())
-                    include = list(db_fields - list_exclude)
+                    include = list(
+                        set(self.model.fields_db_projection().keys()) - list_exclude
+                    )
                 if include:
                     q = q.only(*include)
 
                 q = await self.q(current_user, request, q, ResourceMethod.list)
-
-                # 通用过滤方案
-                # https://tortoise-orm.readthedocs.io/en/latest/query.html
-                if condition:
-                    for raw in condition:
-                        kv = json.loads(raw)
-                        q, iq = await self.translate_kv_condition(
-                            current_user, request, q, kv
-                        )
-                        q = q.filter(iq)
+                for raw in condition:
+                    kv = json.loads(raw)
+                    q, iq = await self.translate_kv_condition(
+                        current_user, request, q, kv
+                    )
+                    q = q.filter(iq)
 
                 summary: Model | None = None
-                include_summary = self.enable_summary and include_summary
-                if include_summary:
+                if self.enable_summary or include_summary:
                     objs = await self.grouping(current_user, q, include, [])
                     if objs:
                         summary = objs[0]
 
                 if group_by:
-                    group_by_fields = ",".join(
-                        [f"COALESCE(`{field}`, '')" for field in group_by]
-                    )
-                    total_q = q.annotate(
-                        total=RawSQL(f"COUNT(DISTINCT {group_by_fields})")
-                    ).group_by()
-                    setattr(total_q, "_fields_for_select", tuple())
-                    r = await total_q.values("total")
-                    total = r[0]["total"] if r else 0
-                else:
-                    total = await DistinctCountQuery(q.count())
-
-                q = q.offset(offset).limit(limit)
-                if group_by:
                     q = self.group_by(current_user, q, include, group_by, order_by)
+                    total = await q.grouped_count()
+                else:
+                    total = await q.count()
+
                 if order_by:
                     orderings: list[str] = []
                     for item in order_by:
@@ -559,10 +450,8 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
                         )
                     q = q.order_by(*orderings)
 
-                if group_by:
-                    objs = await self.grouping_q(q, group_by)
-                else:
-                    objs = await q
+                q = q.offset(offset).limit(limit)
+                objs = await self.grouping_q(q, group_by) if group_by else await q
 
                 if prefetch:
                     for obj in objs:
@@ -579,7 +468,6 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
             @router.get(
                 "/{id}",
                 response_model=DetailPydanticModel,
-                response_class=ORJSONResponse,
                 response_model_exclude_unset=True,
                 response_model_exclude_none=True,
             )
@@ -614,71 +502,56 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
             @router.put(
                 "/{ids}",
                 response_model=DetailPydanticModels,
-                response_class=ORJSONResponse,
                 response_model_exclude_unset=True,
                 response_model_exclude_none=True,
             )
             async def update(
                 request: Request,
                 ids: str = self.ids_path(),
-                input: UpdateForm = self.get_form_type(self.update_form),
+                input: Any = Body(...),
                 include: list[str] = self.include_query(),
                 prefetch: list[str] = self.prefetch_query(),
                 current_user: UserModel = Depends(self.get_current_user),
             ) -> Any:
                 async with in_transaction(self.connection_name):
+                    input = self.update_form.model_validate(input)
                     returns: list[Any] = []
-                    excludes = await self.excludes(ResourceMethod.put)
+                    excludes = await self.excludes(ResourceMethod.put) or set()
                     for obj in await self.get(
                         ids, include, current_user, request, ResourceMethod.put
                     ):
                         r = await self.before_update(current_user, obj, input, request)
                         if r:
                             obj = r
-                            raw = input.model_dump(exclude_unset=True, exclude=excludes)
-
-                            updated_at = raw.pop("updated_at", None)
-                            if updated_at:
-                                # 防止老数据修改
-                                if isinstance(updated_at, str):
-                                    updated_at = json.parse_iso_datetime(updated_at)
-                                if isinstance(updated_at, datetime):
-                                    obj_updated_at: datetime | None = getattr(
-                                        obj, "updated_at", None
+                        raw = input.model_dump(exclude_unset=True, exclude=excludes)
+                        updated_at = raw.pop("updated_at", None)
+                        if updated_at:
+                            if isinstance(updated_at, str):
+                                updated_at = parse_datetime(updated_at)
+                            if isinstance(updated_at, datetime):
+                                obj_updated_at = cast(
+                                    datetime | None, getattr(obj, "updated_at", None)
+                                )
+                                if obj_updated_at:
+                                    obj_updated_at = obj_updated_at.replace(
+                                        microsecond=0
                                     )
-                                    if obj_updated_at:
-                                        # 前端不支持微妙精度
-                                        obj_updated_at = obj_updated_at.replace(
-                                            microsecond=0
-                                        )
-                                        assert obj_updated_at
-                                        if obj_updated_at > updated_at:
-                                            raise HTTPPreconditionRequiredError
+                                if obj_updated_at and obj_updated_at > updated_at:
+                                    raise HTTPPreconditionRequiredError
 
-                            obj_obj = copy(obj)
-
-                            update_fields = raw.keys()
-                            if update_fields:
-                                await obj.update(raw)
-                                obj = await self.before_save(
-                                    current_user, obj, raw, request
-                                )
-                                await obj.save(update_fields=update_fields)
-
-                            if prefetch:
-                                await self.fetch_related(
-                                    obj, ResourceMethod.put, prefetch
-                                )
-
-                            obj_rtn = await self.after_update(
-                                current_user, obj_obj, input, obj, request
-                            )
-                            if obj_rtn:
-                                obj = obj_rtn
-
+                        old_obj = copy(obj)
+                        if raw:
+                            await obj.update(raw)
+                        if prefetch:
+                            await self.fetch_related(obj, ResourceMethod.put, prefetch)
+                        obj_rtn = await self.after_update(
+                            current_user, old_obj, input, obj, request
+                        )
+                        obj = obj_rtn or obj
                         returns.append(
                             obj
                             if isinstance(obj, PydanticBaseModel)
+                            and not isinstance(obj, BaseModel)
                             else DetailPydanticModel.model_validate(obj)
                         )
                     return returns if len(returns) > 1 else returns[0]
@@ -690,7 +563,6 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
             @router.delete(
                 "/{ids}",
                 response_model=list[DeleteResponse] | DeleteResponse,
-                response_class=ORJSONResponse,
                 response_model_exclude_unset=True,
                 response_model_exclude_none=True,
             )
@@ -707,7 +579,7 @@ class API(Generic[UserModel, Model, CreateForm, UpdateForm]):
                         obj = await self.before_delete(current_user, obj, request)
                         await obj.delete()
                         rs.append(DeleteResponse(id=obj.id))
-                    return len(rs) > 1 and rs or rs[0]
+                    return rs if len(rs) > 1 else rs[0]
 
             methods["delete"] = delete
 
@@ -721,9 +593,9 @@ def get_anonymous_user() -> str:
 class PublicAPI(API[str, Model, CreateForm, UpdateForm]):
     def __init__(
         self,
-        model: Type[Model],
-        create_form: Type[CreateForm],
-        update_form: Type[UpdateForm],
+        model: type[Model],
+        create_form: type[CreateForm],
+        update_form: type[UpdateForm],
         enable_create: bool = True,
         enable_update: bool = True,
         enable_delete: bool = True,
@@ -731,9 +603,9 @@ class PublicAPI(API[str, Model, CreateForm, UpdateForm]):
     ) -> None:
         super().__init__(
             model,
-            create_form=create_form,
-            update_form=update_form,
-            get_current_user=get_anonymous_user,
+            create_form,
+            update_form,
+            get_anonymous_user,
             enable_create=enable_create,
             enable_update=enable_update,
             enable_delete=enable_delete,
@@ -741,26 +613,13 @@ class PublicAPI(API[str, Model, CreateForm, UpdateForm]):
         )
 
 
-class DistinctCountQuery(CountQuery):
-    def __init__(self, q: CountQuery) -> None:
-        super().__init__(
-            q.model,  # type: ignore
-            q._db,
-            q._q_objects,
-            q._annotations,
-            q._custom_filters,
-            q._limit,
-            q._offset,
-            q._force_indexes,
-            q._use_indexes,
-        )
+def sa_and(*conditions: Condition) -> Condition:
+    from sqlalchemy import and_
 
-    def _make_query(self) -> None:
-        super()._make_query()
-        setattr(
-            self.query,
-            "_selects",
-            [
-                Count(pikaField("id", table=self.model._meta.basetable)).distinct()  # type: ignore
-            ],
-        )
+    return and_(*conditions)
+
+
+def sa_or(*conditions: Condition) -> Condition:
+    from sqlalchemy import or_
+
+    return or_(*conditions)

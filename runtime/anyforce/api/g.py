@@ -1,14 +1,16 @@
-from typing import Any, Hashable
+from typing import Any, Hashable, MutableMapping, cast
 
 from starlette_context import context
 
 
 def get(k: Hashable) -> Any:
-    return context.data.get(k)  # type: ignore
+    data = cast(MutableMapping[Hashable, Any], cast(Any, context).data)
+    return data.get(k)
 
 
 def set(k: Hashable, v: Any):
-    context.data[k] = v  # type: ignore
+    data = cast(MutableMapping[Hashable, Any], cast(Any, context).data)
+    data[k] = v
 
 
 def user():

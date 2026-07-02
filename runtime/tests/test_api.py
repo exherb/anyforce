@@ -1,9 +1,9 @@
+import json
 from typing import Any
 
 import pytest
 from fastapi import status
 
-from anyforce.json import fast_dumps
 from anyforce.test import TestAPI as Base
 from anyforce.test import TestConfigs
 
@@ -181,13 +181,13 @@ class TestAPI(Base):
 
             # filter
             yield (
-                {"condition": [fast_dumps({"char_enum_field": "b"})]},
+                {"condition": [json.dumps({"char_enum_field": "b"})]},
                 status.HTTP_200_OK,
                 check1,
             )
 
             yield (
-                {"condition": [fast_dumps({"char_enum_field.in": ["b"]})]},
+                {"condition": [json.dumps({"char_enum_field.in": ["b"]})]},
                 status.HTTP_200_OK,
                 check1,
             )

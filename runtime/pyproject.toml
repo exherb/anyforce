@@ -10,7 +10,6 @@ dependencies = [
     "uvicorn[standard]>=0.30.3",
     "pydantic[email]>2.0.0",
     "python-jose[cryptography]>=3.3.0",
-    "tortoise-orm>=0.25.0",
     "orjson>=3.10.6",
     "aiohttp[speedups]>=3.9.5",
     "starlette-context>=0.3.6",
@@ -21,6 +20,7 @@ dependencies = [
     "fastapi>=0.111.1",
     "pydantic-settings>=2.3.4",
     "structlog>=25.1.0",
+    "sqlmodel>=0.0.39",
 ]
 [dependency-groups]
 dev = [
@@ -49,6 +49,7 @@ default = true
 package-dir = {"anyforce" = "anyforce"}
 
 [tool.pyright]
+pythonVersion = "3.11"
 typeCheckingMode = "strict"
 stubPath = "./typings"
 reportIncompatibleVariableOverride = "none"

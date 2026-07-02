@@ -1,17 +1,35 @@
+from __future__ import annotations
+
 import re
-from typing import Any, Match, cast
+from typing import Any, Callable, Iterable, cast
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError, ValidationException
-from fastapi.responses import ORJSONResponse
-from pydantic import ValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
 from pydantic_core import ErrorDetails
-from tortoise import exceptions
+from sqlalchemy.exc import IntegrityError, NoResultFound, SQLAlchemyError
 
 from ..logging import get_logger
 from ..model.enum import EnumMissingError
 
 logger = get_logger(__name__)
+
+
+class ErrorDetail(BaseModel):
+    errors: Any
+
+
+class ErrorResponse(BaseModel):
+    detail: ErrorDetail
+
+
+def error_response(errors: Any, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        ErrorResponse(detail=ErrorDetail(errors=errors)).model_dump(),
+        status_code=status_code,
+    )
+
 
 HTTPForbiddenError = HTTPException(
     status_code=status.HTTP_403_FORBIDDEN, detail={"errors": "禁止访问"}
@@ -27,90 +45,31 @@ HTTPPreconditionRequiredError = HTTPException(
     detail={"errors": "请求数据已过期"},
 )
 
-
 validation_error_translation: dict[str, str] = {
     "bool_parsing": "无法解析为布尔值",
     "bool_type": "不是有效的布尔值",
-    "date_from_datetime_inexact": "不完整的日期",
-    "date_from_datetime_parsing": "无法从日期时间解析出日期",
-    "date_future": "不是将来的日期",
-    "date_parsing": "无法解析日期",
-    "date_past": "不是过去的日期",
-    "date_type": "不是有效的日期",
-    "datetime_from_date_parsing": "无法从日期解析出日期时间",
-    "datetime_future": "不是将来的日期时间",
-    "datetime_object_invalid": "不是有效的日期时间对象",
+    "date_parsing": "无法解析为日期",
     "datetime_parsing": "无法解析为日期时间",
-    "datetime_past": "不是过去的日期时间",
-    "datetime_type": "不是有效的日期时间",
-    "decimal_max_digits": "定点数数字过多",
-    "decimal_max_places": "定点数小数部分过多",
-    "decimal_parsing": "无法解析为定点数",
-    "decimal_type": "不是有效的定点数",
-    "decimal_whole_digits": "定点数整数部分过多",
-    "dict_type": "不是有效的字典",
-    "enum": "枚举不存在",
-    "finite_number": "无穷大",
+    "decimal_parsing": "无法解析为数字",
+    "enum": "不是有效的枚举值",
     "float_parsing": "无法解析为浮点数",
-    "float_type": "不是有效的浮点数",
-    "get_attribute_error": "无法获取属性",
-    "greater_than": "过大",
-    "greater_than_equal": "过大或等于",
-    "int_from_float": "无法从浮点数解析为整数",
     "int_parsing": "无法解析为整数",
-    "int_type": "不是有效的整数",
-    "invalid_key": "不是有效的键值",
-    "is_instance_of": "不是有效的类型",
-    "is_subclass_of": "不是有效的父类型",
-    "iterable_type": "不可迭代",
-    "iteration_error": "不是有效的迭代器",
-    "json_invalid": "无法解析为 JSON",
-    "json_type": "不是有效的 JSON",
-    "less_than": "过小",
-    "less_than_equal": "过小或等于",
-    "list_type": "不是有效的数组",
-    "literal_error": "不是有效的字符",
-    "mapping_type": "不是有效的映射",
-    "missing": "为必填项目",
-    "model_attributes_type": "无法获取模型属性",
-    "model_type": "不是有效的模型",
-    "multiple_of": "不是有效的倍数",
-    "no_such_attribute": "不存在该属性",
-    "none_required": "只允许 null",
-    "recursion_loop": "死循环",
-    "set_type": "不是有效的集合",
-    "string_pattern_mismatch": "不符合字符串规则",
-    "string_sub_type": "不是有效的字符类型",
-    "string_too_long": "字符串过长",
-    "string_too_short": "字符串过短",
-    "string_type": "不是有效的字符",
-    "string_unicode": "不是有效的字符编码",
-    "time_delta_parsing": "无法解析为时间间隔",
-    "time_delta_type": "不是有效的时间间隔",
-    "time_parsing": "无法解析为时间",
-    "time_type": "不是有效的时间",
-    "timezone_aware": "缺少时区",
-    "timezone_naive": "不是本地时间",
+    "json_invalid": "不是有效的 JSON",
+    "missing": "必填",
+    "string_too_long": "太长",
     "too_long": "太长",
     "too_short": "太短",
-    "tuple_type": "不是有效的元祖",
     "url_parsing": "无法解析为链接",
-    "url_scheme": "不是有效的链接协议",
-    "url_syntax_violation": "不符合有效的链接规则",
-    "url_too_long": "链接太长",
-    "url_type": "不是有效的链接",
     "uuid_parsing": "无法解析为 UUID",
-    "uuid_type": "不是有效的 UUID",
-    "uuid_version": "不是有效的 UUID 版本",
     "value_error": "不是有效的值",
 }
 
 
-def translate_validation_exception(e: ValidationException):
-    msgs = set[str]()
+def translate_validation_exception(e: ValidationException) -> list[str]:
+    msgs: set[str] = set()
     for child_e in e.errors():
         if isinstance(child_e, ValidationError):
-            msgs = msgs.union(translate_validation_error(child_e))
+            msgs.update(translate_validation_error(child_e))
         elif isinstance(child_e, dict):
             msgs.add(translate_validation_error_detail(cast(dict[str, Any], child_e)))
         else:
@@ -119,134 +78,119 @@ def translate_validation_exception(e: ValidationException):
     return list(msgs)
 
 
-def translate_validation_error(e: ValidationError):
-    msgs = set[str]()
+def translate_validation_error(e: ValidationError) -> set[str]:
+    msgs: set[str] = set()
     for error in e.errors():
         msgs.add(translate_validation_error_detail(error))
     return msgs
 
 
-def translate_validation_error_detail(e: dict[str, Any] | ErrorDetails):
-    typ: str = e.get("type", "")
-    msg: str = e.get("msg", "")
-    value = e["input"] or ""
+def translate_validation_error_detail(e: dict[str, Any] | ErrorDetails) -> str:
+    typ = str(e.get("type", ""))
+    msg = str(e.get("msg", ""))
+    value = e.get("input") or ""
     path = ".".join([str(x) for x in e.get("loc", [])])
-
     translate_msg = validation_error_translation.get(typ)
     if not translate_msg:
         logger.bind(raw_error=e, raw_error_type=type(e), msg=msg).info(
             "translate exception"
         )
-    msg = translate_msg or msg
-
-    return f"{value} {msg}: {path}"
+    return f"{value} {translate_msg or msg}: {path}"
 
 
-def translate_validate_error(e: ValidationError | list[ValidationError]):
-    msgs = set[str]()
-    errors: list[Any] = e if isinstance(e, list) else [e]
+def translate_validate_error(e: ValidationError | list[ValidationError]) -> list[str]:
+    msgs: set[str] = set()
+    errors = e if isinstance(e, list) else [e]
     for error in errors:
-        msgs = msgs.union(translate_validation_error(error))
+        msgs.update(translate_validation_error(error))
     return list(msgs)
 
 
-def translate_orm_error(
-    e: exceptions.BaseORMException,
-) -> tuple[int, list[str]]:
-    if isinstance(e, exceptions.IntegrityError):
+def translate_orm_error(e: SQLAlchemyError | NoResultFound) -> tuple[int, list[str]]:
+    if isinstance(e, IntegrityError):
         status_code = status.HTTP_400_BAD_REQUEST
         args: list[str] = []
         for arg in e.args:
-            regexps = [
+            matched = None
+            for regexp in (
                 ".*Duplicate entry '(.+)' for key.*",
-                "UNIQUE constraint failed: .*",
-            ]
-            matched: Match[str] | None = None
-            for regexp in regexps:
+                ".*UNIQUE constraint failed: .*",
+            ):
                 matched = re.match(regexp, str(arg))
                 if matched:
                     status_code = status.HTTP_409_CONFLICT
-                    groups = matched.groups()
-                    value = groups and groups[0] or ""
-                    arg = f"值为 {value} 的对象已存在" if value else "对象已存在"
+                    value = matched.groups()[0] if matched.groups() else ""
+                    args.append(f"值为 {value} 的对象已存在" if value else "对象已存在")
                     break
             if not matched:
                 logger.bind(arg=arg, type=type(arg)).warn("not translate")
-            args.append(str(arg))
+                args.append(str(arg))
         return status_code, args
-    if isinstance(e, exceptions.ValidationError):
-        return status.HTTP_400_BAD_REQUEST, [str(args) for args in e.args]
-    if isinstance(e, exceptions.DoesNotExist):
+    if isinstance(e, NoResultFound):
         return status.HTTP_404_NOT_FOUND, ["不存在"]
     raise e
 
 
-def handlers():
-    async def valueExceptionHandle(
-        request: Request | None, exc: ValueError
-    ) -> ORJSONResponse:
-        msg = str(exc)
-        regexps = [
-            (r"invalid literal for int\(\) with base 10: '(.+)'", "{0} 不是有效的整数"),
-            ("could not convert string to float: '(.+)'", "{0} 不是有效的浮点数"),
-        ]
-        matched: Match[str] | None = None
-        for regexp, msg_template in regexps:
-            matched = re.match(regexp, msg)
-            if matched:
-                groups = matched.groups()
-                msg = msg_template.format(*groups)
-                break
-        if not matched:
-            logger.bind(msg=msg, type=type(exc)).warn("not translate")
-        return ORJSONResponse(
-            {"detail": {"errors": msg}},
-            status_code=status.HTTP_400_BAD_REQUEST,
-        )
+async def valueExceptionHandle(
+    request: Request | None, exc: ValueError
+) -> JSONResponse:
+    msg = str(exc)
+    regexps = [
+        (r"invalid literal for int\(\) with base 10: '(.+)'", "{0} 不是有效的整数"),
+        (r"could not convert string to float: '(.+)'", "{0} 不是有效的浮点数"),
+    ]
+    for regexp, msg_template in regexps:
+        matched = re.match(regexp, msg)
+        if matched:
+            msg = msg_template.format(*matched.groups())
+            break
+    return error_response(msg, status.HTTP_400_BAD_REQUEST)
 
-    async def validationExceptionHandle(
-        request: Request | None, exc: ValidationException
-    ) -> ORJSONResponse:
-        return ORJSONResponse(
-            {"detail": {"errors": translate_validation_exception(exc)}},
-            status_code=status.HTTP_400_BAD_REQUEST,
-        )
 
-    async def validationErrorHandle(
-        request: Request | None, exc: ValidationError
-    ) -> ORJSONResponse:
-        return ORJSONResponse(
-            {"detail": {"errors": translate_validate_error(exc)}},
-            status_code=status.HTTP_400_BAD_REQUEST,
-        )
+async def validationExceptionHandle(
+    request: Request | None, exc: ValidationException
+) -> JSONResponse:
+    return error_response(
+        translate_validation_exception(exc), status.HTTP_400_BAD_REQUEST
+    )
 
-    async def ormException(
-        request: Request | None, exc: exceptions.BaseORMException
-    ) -> ORJSONResponse:
-        status_code, msgs = translate_orm_error(exc)
-        return ORJSONResponse(
-            {"detail": {"errors": msgs}},
-            status_code=status_code,
-        )
 
-    async def enumMissingErrorHandle(
-        request: Request | None, exc: EnumMissingError
-    ) -> ORJSONResponse:
-        return ORJSONResponse(
-            {"detail": {"errors": [str(args) for args in exc.args]}},
-            status_code=status.HTTP_400_BAD_REQUEST,
-        )
+async def validationErrorHandle(
+    request: Request | None, exc: ValidationError
+) -> JSONResponse:
+    return error_response(translate_validate_error(exc), status.HTTP_400_BAD_REQUEST)
 
+
+async def ormException(
+    request: Request | None, exc: SQLAlchemyError | NoResultFound
+) -> JSONResponse:
+    status_code, msgs = translate_orm_error(exc)
+    return error_response(msgs, status_code)
+
+
+async def enumMissingErrorHandle(
+    request: Request | None, exc: EnumMissingError
+) -> JSONResponse:
+    return error_response([str(args) for args in exc.args], status.HTTP_400_BAD_REQUEST)
+
+
+def handlers() -> tuple[
+    tuple[Iterable[type[Exception]], Callable[..., Any]],
+    tuple[Iterable[type[Exception]], Callable[..., Any]],
+    tuple[Iterable[type[Exception]], Callable[..., Any]],
+    tuple[Iterable[type[Exception]], Callable[..., Any]],
+    tuple[Iterable[type[Exception]], Callable[..., Any]],
+]:
     return (
         ([ValueError], valueExceptionHandle),
         ([RequestValidationError, ValidationError], validationErrorHandle),
-        ([exceptions.BaseORMException], ormException),
+        ([SQLAlchemyError, NoResultFound], ormException),
         ([EnumMissingError], enumMissingErrorHandle),
         ([RequestValidationError], validationExceptionHandle),
     )
 
 
-def register(app: FastAPI):
+def register(app: FastAPI) -> None:
     for errors, handler in handlers():
-        for e in errors:
-            app.exception_handler(e)(handler)
+        for error in errors:
+            app.exception_handler(error)(handler)

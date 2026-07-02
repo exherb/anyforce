@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, cast
@@ -10,7 +12,7 @@ from fastapi.encoders import jsonable_encoder
 def fast_dumps_default(obj: Any) -> Any:
     if isinstance(obj, Decimal):
         return str(obj)
-    raise TypeError
+    return jsonable_encoder(obj)
 
 
 def fast_dumps(o: Any) -> str:
@@ -62,6 +64,6 @@ def decoder(input: Any) -> Any:
     return input
 
 
-def loads(raw: bytes | bytearray | str):
+def loads(raw: bytes | bytearray | str) -> Any:
     o = orjson.loads(raw)
     return decoder(o)

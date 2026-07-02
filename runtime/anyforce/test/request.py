@@ -1,10 +1,8 @@
-import json as stdjson
 from typing import Any
 
 import httpx
+from fastapi.encoders import jsonable_encoder
 from fastapi.testclient import TestClient
-
-from ..json import raw_dumps
 
 
 class Response(object):
@@ -49,7 +47,7 @@ def request(
     **kwargs: Any,
 ) -> Response:
     if json:
-        json = stdjson.loads(raw_dumps(json))
+        json = jsonable_encoder(json)
     r = client.request(
         method,
         url,
